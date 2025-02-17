@@ -1,0 +1,7 @@
+2025-02-17 04:23:06,210 - INFO - Created directory: youtube_content/RICH DAD POOR DAD
+2025-02-17 04:23:06,210 - INFO - Created directory: youtube_content/RICH DAD POOR DAD/script
+2025-02-17 04:23:06,210 - INFO - Created directory: youtube_content/RICH DAD POOR DAD/voice_over
+2025-02-17 04:23:06,210 - INFO - Generating comprehensive video script...
+2025-02-17 04:23:10,142 - INFO - HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2025-02-17 04:23:10,145 - INFO - Saved all script content successfully
+2025-02-17 04:23:10,145 - INFO - Video script generation completed successfully
