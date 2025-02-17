@@ -1,0 +1,5 @@
+groq==0.3.2
+python-dotenv==1.0.1
+colorama==0.4.6
+pathlib==1.0.1
+typing==3.7.4.3 
