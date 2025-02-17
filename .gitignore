@@ -3,3 +3,4 @@ books/
 youtube_content/
 logs/
 __pycache__/
+elevenlabs_apis

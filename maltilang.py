@@ -15,28 +15,9 @@ from elevenlabs import ElevenLabs
 class StoryPlanner:
     """Handles story planning and generation using the Groq API for YouTube content."""
     
-    def __init__(self, model: str = "llama-3.3-70b-versatile", language: str = "en", show_logs: bool = False):
+    def __init__(self, model: str = "llama-3.3-70b-versatile", language: str = "en", show_logs: bool = False, test_audio: bool = False):
         """Initialize the StoryPlanner with API configuration."""
-        load_dotenv()
-        self.api_key = os.getenv("GROQ_API_KEY")
-        if not self.api_key:
-            raise ValueError("GROQ_API_KEY not found in environment variables")
-            
-        self.client = Groq(api_key=self.api_key)
-        self.model = model
-        
-        # Initialize Eleven Labs client
-        self.elevenlabs_key = os.getenv("ELEVENLABS_API_KEY")
-        if not self.elevenlabs_key:
-            raise ValueError("ELEVENLABS_API_KEY not found in environment variables")
-        self.tts_client = ElevenLabs(api_key=self.elevenlabs_key)
-        
-        # Add language configuration
-        self.language = language
-        self.lang_config = get_language_config(language)
-        self.script_template = get_script_template(self.lang_config['script_style'])
-        
-        # Setup logging with error handling
+        # Setup logging first
         try:
             log_directory = Path("logs")
             log_directory.mkdir(parents=True, exist_ok=True)
@@ -64,9 +45,191 @@ class StoryPlanner:
             if show_logs:
                 self.logger.info(f"Logging initialized. Log file: {log_file}")
         except Exception as e:
-            if show_logs:
-                print(f"Failed to initialize logging: {str(e)}")
+            print(f"Warning: Failed to initialize logging: {str(e)}")
+            self.logger = None
+        
+        # Load environment variables
+        load_dotenv()
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY not found in environment variables")
+            
+        self.client = Groq(api_key=self.api_key)
+        self.model = model
+        
+        # Initialize Eleven Labs client and API keys
+        self.elevenlabs_keys = self._load_elevenlabs_keys()
+        self.current_key_index = 0
+        
+        # Test audio generation if requested
+        if test_audio:
+            self._test_audio_generation()
+        else:
+            self.tts_client = self._initialize_elevenlabs_client()
+        
+        # Add language configuration
+        self.language = language
+        self.lang_config = get_language_config(language)
+        self.script_template = get_script_template(self.lang_config['script_style'])
+
+    def _load_elevenlabs_keys(self) -> list:
+        """Load ElevenLabs API keys from file."""
+        try:
+            keys = []
+            with open('elevenlabs_apis', 'r') as f:
+                for line in f:
+                    # Extract only the API key part (after the colon)
+                    if ':' in line:
+                        key = line.strip().split(':')[1]
+                        if key.startswith('sk_'):  # Validate key format
+                            keys.append(key)
+            
+            if not keys:
+                raise ValueError("No valid API keys found in elevenlabs_apis file")
+            
+            if self.logger:
+                self.logger.info(f"Loaded {len(keys)} API keys successfully")
+            else:
+                print(f"Loaded {len(keys)} API keys successfully")
+            return keys
+            
+        except Exception as e:
+            error_msg = f"Error loading ElevenLabs API keys: {str(e)}"
+            if self.logger:
+                self.logger.error(error_msg)
+            else:
+                print(f"Error: {error_msg}")
             raise
+
+    def _initialize_elevenlabs_client(self) -> ElevenLabs:
+        """Initialize ElevenLabs client with current API key."""
+        return ElevenLabs(api_key=self.elevenlabs_keys[self.current_key_index])
+
+    def _rotate_elevenlabs_key(self):
+        """Rotate to the next available API key."""
+        self.current_key_index = (self.current_key_index + 1) % len(self.elevenlabs_keys)
+        self.tts_client = self._initialize_elevenlabs_client()
+        self.logger.info(f"Rotated to new API key (index: {self.current_key_index})")
+
+    def _check_credit_balance(self, text: str) -> bool:
+        """
+        Check if there are enough credits to process the text.
+        Returns True if sufficient credits available, False otherwise.
+        """
+        try:
+            # Get user subscription info
+            user_info = self.tts_client.user.get()
+            
+            if hasattr(user_info, 'subscription'):
+                # Calculate remaining character quota
+                remaining_chars = user_info.subscription.character_count
+                # Estimate required characters (including some buffer)
+                required_chars = len(text) * 1.1  # Add 10% buffer
+                
+                if self.logger:
+                    self.logger.info(f"Credit check - Remaining: {remaining_chars}, Required: {required_chars}")
+                else:
+                    print(f"Credit check - Remaining: {remaining_chars}, Required: {required_chars}")
+                
+                return remaining_chars >= required_chars
+            return True  # If can't get subscription info, assume ok
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(f"Failed to check credit balance: {str(e)}")
+            else:
+                print(f"Warning: Failed to check credit balance: {str(e)}")
+            return True  # If check fails, assume ok to proceed
+    
+    def _estimate_total_credits_needed(self, text_files: list) -> int:
+        """
+        Estimate total credits needed for all text files.
+        Returns estimated character count needed.
+        """
+        total_chars = 0
+        try:
+            for file_path in text_files:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    total_chars += len(content)
+            
+            # Add 10% buffer
+            total_chars = int(total_chars * 1.1)
+            
+            if self.logger:
+                self.logger.info(f"Estimated total characters needed: {total_chars}")
+            else:
+                print(f"Estimated total characters needed: {total_chars}")
+                
+            return total_chars
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error estimating credits: {str(e)}")
+            else:
+                print(f"Error estimating credits: {str(e)}")
+            return 0
+
+    def _handle_text_to_speech(self, text: str, max_retries: int = 3) -> bytes:
+        """Handle text-to-speech conversion with API key rotation and credit check."""
+        # Check credits before processing
+        if not self._check_credit_balance(text):
+            error_msg = "Insufficient credits to process text"
+            if self.logger:
+                self.logger.error(error_msg)
+            else:
+                print(f"Error: {error_msg}")
+            raise ValueError(error_msg)
+            
+        tried_keys = set()  # Keep track of keys we've tried
+        initial_key_index = self.current_key_index  # Remember where we started
+        
+        while True:
+            current_key = self.elevenlabs_keys[self.current_key_index]
+            
+            if current_key in tried_keys:
+                if len(tried_keys) >= len(self.elevenlabs_keys):
+                    # If we've tried all keys, wait for 5 minutes and try again
+                    self.logger.warning("All keys tried, waiting 5 minutes before retrying...")
+                    time.sleep(10)  # Wait 5 minutes
+                    tried_keys.clear()  # Clear tried keys to start fresh
+                    continue
+                
+                # Move to next key if current one is already tried
+                self._rotate_elevenlabs_key()
+                continue
+            
+            try:
+                tried_keys.add(current_key)
+                self.logger.info(f"Trying key {self.current_key_index + 1}/{len(self.elevenlabs_keys)}")
+                
+                audio_stream = self.tts_client.text_to_speech.convert(
+                    voice_id="JBFqnCBsd6RMkjVDRZzb",
+                    output_format="mp3_44100_128",
+                    text=text,
+                    model_id="eleven_multilingual_v2"
+                )
+                
+                audio_data = b''
+                for chunk in audio_stream:
+                    if chunk is not None:
+                        audio_data += chunk
+                return audio_data
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'quota_exceeded' in error_str or '401' in error_str or 'unauthorized' in error_str:
+                    self.logger.warning(f"Quota exceeded or unauthorized for key {self.current_key_index + 1}, trying next key...")
+                    self._rotate_elevenlabs_key()
+                    
+                    # If we've cycled through all keys once
+                    if self.current_key_index == initial_key_index:
+                        self.logger.warning("Cycled through all keys once, waiting 5 minutes before retrying...")
+                        time.sleep(10)  # Wait 5 minutes
+                        tried_keys.clear()  # Clear tried keys to start fresh
+                    continue
+                else:
+                    self.logger.error(f"Error in text-to-speech conversion: {str(e)}")
+                    raise
 
     def _create_project_structure(self, book_name: str) -> Dict[str, Path]:
         """Create project structure for the book content."""
@@ -254,6 +417,7 @@ class StoryPlanner:
                 intro_content = self._make_api_call(intro_messages)
             
             # Get title content
+            is_final_title = title_number == self.how_many_titles(book_name)
             messages = [
                 {
                     "role": "system",
@@ -261,7 +425,7 @@ class StoryPlanner:
                 },
                 {
                     "role": "user",
-                    "content": f"Create an engaging YouTube-style script for title {title_number} of '{book_name}'. Include real examples and stories that illustrate the main ideas. Make it conversational and easy to follow. If this is the last title ({title_number}), wrap up with key takeaways and a call-to-action."
+                    "content": f"Create an engaging YouTube-style script for {'the final title' if is_final_title else f'title {title_number}'} of '{book_name}'. Include real examples and stories that illustrate the main ideas. Make it conversational and easy to follow. {'Include a conclusion and call-to-action.' if is_final_title else ''}"
                 }
             ]
             title_content = self._make_api_call(messages)
@@ -279,14 +443,19 @@ class StoryPlanner:
             final_content = []
             if title_number == 1:
                 final_content.append("Hey everyone! " + cleaned_intro + "\n\n")
+            else:
+                final_content.append("Hey everyone, welcome back! ")
             
             # Add the title name explicitly at the start of content
             title_name = cleaned_content.split('.')[0]
-            final_content.append(f"In today's part {title_number}, we're diving into {title_name}\n\n")
+            if is_final_title:
+                final_content.append(f"In today's video, we're covering the final title of {book_name}\n\n")
+            else:
+                final_content.append(f"In today's video, we're diving into part {title_number} of {book_name}\n\n")
             final_content.append(cleaned_content)
             
             # Add end card for the last title
-            if title_number == self.how_many_titles(book_name):
+            if is_final_title:
                 end_card = "\n\nThat's all for today's video! If you enjoyed this summary and found value in these insights, don't forget to like and subscribe for more book summaries like this one. Hit that notification bell to stay updated with our latest videos. Share this with someone who might benefit from these lessons. Thanks for watching, and I'll see you in the next video!"
                 final_content.append(end_card)
             
@@ -295,10 +464,25 @@ class StoryPlanner:
             # Save title script
             title_number_padded = f"{title_number:02d}"
             script_path = titles_dir / f"title_{title_number_padded}_script.txt"
+            voiceover_script_path = titles_dir / f"title_{title_number_padded}_script_voiceover.txt"
+            
+            # Save the full script with all content
             with open(script_path, 'w', encoding='utf-8') as f:
                 f.write(f"Title {title_number} of {book_name}\n")
                 f.write("=" * 80 + "\n\n")
                 f.write(final_script)
+            
+            # Create clean voice-over version (remove visual instructions)
+            clean_script = re.sub(r'\([^)]*\)', '', final_script)  # Remove anything in parentheses
+            clean_script = re.sub(r'Host: *', '', clean_script)    # Remove "Host:" markers
+            clean_script = re.sub(r'\n\s*\n\s*\n', '\n\n', clean_script)  # Normalize multiple line breaks
+            clean_script = clean_script.strip()
+            
+            # Save the clean voice-over script
+            with open(voiceover_script_path, 'w', encoding='utf-8') as f:
+                f.write(f"Title {title_number} of {book_name}\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(clean_script)
             
             # Generate audio for this title
             audio_path = titles_dir / f"title_{title_number_padded}_audio.mp3"
@@ -326,22 +510,13 @@ class StoryPlanner:
                 return chunks
             
             # Process title audio
-            text_chunks = chunk_text(final_script)
+            text_chunks = chunk_text(clean_script)  # Use clean_script instead of final_script
             
             with open(audio_path, 'wb') as audio_file:
                 for chunk_num, chunk in enumerate(text_chunks, 1):
                     self.logger.info(f"Processing chunk {chunk_num}/{len(text_chunks)} of title {title_number}...")
-                    
-                    audio_stream = self.tts_client.text_to_speech.convert(
-                        voice_id="JBFqnCBsd6RMkjVDRZzb",
-                        output_format="mp3_44100_128",
-                        text=chunk,
-                        model_id="eleven_multilingual_v2"
-                    )
-                    
-                    for audio_chunk in audio_stream:
-                        if audio_chunk is not None:
-                            audio_file.write(audio_chunk)
+                    audio_data = self._handle_text_to_speech(chunk)
+                    audio_file.write(audio_data)
                     
                     if chunk_num < len(text_chunks):
                         time.sleep(1)  # Prevent rate limiting
@@ -356,6 +531,51 @@ class StoryPlanner:
     def generate_voice_over(self, script_data: dict, paths: Dict[str, Path], show_logs: bool = False) -> None:
         """Generate voice-over audio files for each title and section."""
         try:
+            # First, collect all text files that will need processing
+            text_files = []
+            
+            # Add title scripts
+            book_name = script_data['title']
+            num_titles = self.how_many_titles(book_name)
+            titles_dir = paths['voice_over'] / "titles"
+            for title_num in range(1, num_titles + 1):
+                title_number_padded = f"{title_num:02d}"
+                script_path = titles_dir / f"title_{title_number_padded}_script_voiceover.txt"
+                if script_path.exists():
+                    text_files.append(script_path)
+            
+            # Add section scripts
+            sections_dir = paths['voice_over'] / "sections"
+            for i, section in enumerate(script_data['sections'], 1):
+                section_number = f"{i:02d}"
+                script_path = sections_dir / f"{section_number}_section_script.txt"
+                if script_path.exists():
+                    text_files.append(script_path)
+            
+            # Estimate total credits needed
+            total_chars_needed = self._estimate_total_credits_needed(text_files)
+            
+            # Check if we have enough credits with any key
+            sufficient_credits = False
+            for key in self.elevenlabs_keys:
+                self.tts_client = ElevenLabs(api_key=key)
+                if self._check_credit_balance("x" * total_chars_needed):
+                    sufficient_credits = True
+                    break
+            
+            if not sufficient_credits:
+                error_msg = f"Insufficient credits to process all files. Need approximately {total_chars_needed} characters."
+                if self.logger:
+                    self.logger.error(error_msg)
+                else:
+                    print(f"Error: {error_msg}")
+                raise ValueError(error_msg)
+            
+            # Reset client to first key
+            self.current_key_index = 0
+            self.tts_client = self._initialize_elevenlabs_client()
+            
+            # Continue with existing voice-over generation code
             # First, get the number of titles
             book_name = script_data['title']
             num_titles = self.how_many_titles(book_name)
@@ -407,16 +627,8 @@ class StoryPlanner:
                     for chunk_num, chunk in enumerate(text_chunks, 1):
                         self.logger.info(f"Processing chunk {chunk_num}/{len(text_chunks)} of section {i}...")
                         
-                        audio_stream = self.tts_client.text_to_speech.convert(
-                            voice_id="JBFqnCBsd6RMkjVDRZzb",
-                            output_format="mp3_44100_128",
-                            text=chunk,
-                            model_id="eleven_multilingual_v2"
-                        )
-                        
-                        for audio_chunk in audio_stream:
-                            if audio_chunk is not None:
-                                section_file.write(audio_chunk)
+                        audio_data = self._handle_text_to_speech(chunk)
+                        section_file.write(audio_data)
                         
                         if chunk_num < len(text_chunks):
                             time.sleep(1)
@@ -449,6 +661,46 @@ class StoryPlanner:
                 else:
                     raise
 
+    def _test_audio_generation(self):
+        """Test audio generation capability for all loaded keys."""
+        print(f"\n{Fore.CYAN}🔍 Testing ElevenLabs API Keys for Audio Generation...{Style.RESET_ALL}\n")
+        
+        working_keys = []
+        total_keys = len(self.elevenlabs_keys)
+        
+        for i, key in enumerate(self.elevenlabs_keys, 1):
+            print(f"\r{Fore.CYAN}Testing key {i}/{total_keys}...{Style.RESET_ALL}", end='')
+            
+            try:
+                client = ElevenLabs(api_key=key)
+                # Try to generate a very short audio
+                audio = client.text_to_speech.convert(
+                    text="Test.",
+                    voice_id="JBFqnCBsd6RMkjVDRZzb",
+                    output_format="mp3_44100_128",
+                    model_id="eleven_multilingual_v2"
+                )
+                working_keys.append(key)
+                print(f"\r{Fore.GREEN}✓ Key {i}: Working{Style.RESET_ALL}")
+            except Exception as e:
+                print(f"\r{Fore.RED}✗ Key {i}: Failed - {str(e)}{Style.RESET_ALL}")
+            
+            print()  # New line after each key
+        
+        print("\n" + "=" * 80)
+        print(f"{Fore.CYAN}Audio Generation Test Results:{Style.RESET_ALL}")
+        print(f"Total Keys: {total_keys}")
+        print(f"Working Keys: {Fore.GREEN}{len(working_keys)}{Style.RESET_ALL}")
+        print(f"Failed Keys: {Fore.RED}{total_keys - len(working_keys)}{Style.RESET_ALL}")
+        
+        if working_keys:
+            # Update the keys list to only include working keys
+            self.elevenlabs_keys = working_keys
+            self.tts_client = self._initialize_elevenlabs_client()
+            print(f"\n{Fore.GREEN}Successfully initialized with {len(working_keys)} working keys{Style.RESET_ALL}")
+        else:
+            raise ValueError("No working keys found for audio generation")
+
 def main():
     """Main execution function."""
     # Initialize colorama
@@ -457,6 +709,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='YouTube Book Video Script Generator')
     parser.add_argument('--log', action='store_true', help='Show detailed logs instead of pretty output')
+    parser.add_argument('--audio', action='store_true', help='Test audio generation capability for all keys')
     args = parser.parse_args()
 
     try:
@@ -472,9 +725,13 @@ def main():
                 break
             print(f"{Fore.RED}❌ Unsupported language code. Please choose from: {', '.join(SUPPORTED_LANGUAGES.keys())}{Style.RESET_ALL}")
         
-        # Initialize planner with show_logs parameter
-        planner = StoryPlanner(language=language, show_logs=args.log)
+        # Initialize planner with show_logs and test_audio parameters
+        planner = StoryPlanner(language=language, show_logs=args.log, test_audio=args.audio)
         
+        # If only testing audio, exit after initialization
+        if args.audio:
+            return
+            
         while True:
             book_name = input(f"{Fore.CYAN}📖 Enter the name of the book for video creation:{Style.RESET_ALL} ").strip()
             if book_name:
